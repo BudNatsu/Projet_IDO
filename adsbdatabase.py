@@ -7,28 +7,18 @@ import re
 import logging
 import requests
 
-################################################################################
-# Global Variables
-################################################################################
-
 run_app = True
 
 logging.basicConfig(
     level = logging.INFO,
     format = '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
-log = logging.getLogger('adsb2influx')
-
-################################################################################
-# Classes
-################################################################################
-
+log = logging.getLogger('adsbdatabase')
 
 class AdsbError(Exception):
     pass
 
-
-class AdsbProcessor(object):
+class Adsbmeg(object):
 
     REGEXP_MSG = r'^MSG,' \
         r'(?P<transmission>\d),' \
@@ -73,35 +63,8 @@ class AdsbProcessor(object):
 
     def __init__(self):
         self.re_msg = re.compile(self.REGEXP_MSG)
-        self.aircrafts = {}
-        self.aircrafts_age = {}
-
-    def __getitem__(self, key):
-        return self.aircrafts[key]
-
-    def __setitem__(self, key, value):
-        self.aircrafts[key] = value
-
-    def __delitem__(self, key):
-        del self.aircrafts[key]
-
-    def __contains__(self, key):
-        return key in self.aircrafts
-
-    def __len__(self):
-        return len(self.aircrafts)
-
-    def __repr__(self):
-        return repr(self.aircrafts)
-
-    def __cmp__(self, dict_):
-        return self.__cmp__(self.aircrafts, dict_)
-
-    def __iter__(self):
-        return iter(self.aircrafts)
-
-    def __unicode__(self):
-        return unicode(repr(self.aircrafts))
+        self.avions = {}
+        self.avions_age = {}
 
     def __normalize_msg(self, msg):
         for field, fnc in self.NORMALIZE_MSG.items():
@@ -111,57 +74,85 @@ class AdsbProcessor(object):
         return msg
 
     def keys(self):
-        return self.aircrafts.keys()
+        return self.avions.keys()
 
     def values(self):
-        return self.aircrafts.values()
+        return self.avions.values()
 
     def items(self):
-        return self.aircrafts.items()
+        return self.avions.items()
 
     def pop(self, *args):
-        return self.aircrafts.pop(*args)
+        return self.avions.pop(*args)
 
-    def clear(self, age):
-        '''Delete all aircrafts whose messages are older than 'age' seconds. Reset counters.'''
-        for hexident in list(self.aircrafts_age.keys()):
-            if hexident not in self.aircrafts:
-                del self.aircrafts_age[hexident]
-                continue
-
-            if (time.time() - self.aircrafts_age[hexident]) > age:
-                log.info('Hexident {} too old. Deleting.'.format(hexident))
-                del self.aircrafts_age[hexident]
-                del self.aircrafts[hexident]
-
-        for hexident in self.aircrafts.keys():
-            self.aircrafts[hexident]['count'] = 0
 
     def age(self, hexident):
-        '''Return age of 'hexident' aircraft. Seconds since last seen.'''
-        return (time.time() - self.aircrafts_age.get(hexident, 0))
+        return (time.time() - self.avions_age.get(hexident, 0))
 
     def msg(self, data):
-        '''Parse and save new ADS-B message.'''
 
         m = self.re_msg.match(data)
         if not m:
-            log.error('Wrong format for MSG: \'{}\'.'.format(data))
-            raise AdsbError('Message has wrong format!')
-            pass 
+            log.error('Mauvais format MSG: \'{}\'.'.format(data))
+            raise AdsbError('Mauvais format pour ce message!')
+            pass
 
         message = {k: v for k, v in m.groupdict().items() if v}
         message = self.__normalize_msg(message)
 
-        self.aircrafts_age[message['hexident']] = time.time()
+        self.avions_age[message['hexident']] = time.time()
 
-        if message['hexident'] not in self.aircrafts:
-            self.aircrafts[message['hexident']] = message
-            self.aircrafts[message['hexident']]['count'] = 1
+        if message['hexident'] not in self.avions:
+            self.avions[message['hexident']] = message
+            self.avions[message['hexident']]['count'] = 1
         else:
-            self.aircrafts[message['hexident']].update(message)
-            self.aircrafts[message['hexident']]['count'] += 1
+            self.avions[message['hexident']].update(message)
+            self.avions[message['hexident']]['count'] += 1
+            
+class InfluxDB(object):
+    def __init__(self, url, database='dump1090', username="admin", password="influx"):
+        self.url = url
+        self.params = '/write?precision=s&db={}'.format(database)
 
+    def write(self, measurement, data, timestamp=None):
+
+        lines = []
+
+        for d in data:
+            fields = []
+            for k, v in d['fields'].items():
+                if v is None:
+                    continue
+                elif type(v) is bool:
+                    fields.append('{}={}'.format(k, 't' if v else 'f'))
+                elif type(v) is int:
+                    fields.append('{}={}i'.format(k, v))
+                elif type(v) is float:
+                    fields.append('{}={}'.format(k, v))
+                elif type(v) is str:
+                    fields.append('{}="{}"'.format(k, v))
+                else:
+                    log.warning('Le type {} n''est supporté par InfluxDB. {}={}.'.format(
+                        type(v), k, v
+                    ))
+
+            lines.append('{measurement},{tags} {fields} {timestamp}'.format(
+                measurement = measurement,
+                tags = ','.join('{}={}'.format(k, v) for k, v in d['tags'].items()),
+                fields = ','.join(x for x in fields),
+                timestamp = d['timestamp'] if 'timestamp' in d else int(time.time()),
+            ))
+
+        resp = requests.post(self.url + self.params, data = '\n'.join(l for l in lines))
+        if resp.status_code == 204:
+            return True
+
+        log.error('Ecriture impossible. Le code erreur est {}'.format(resp.status_code))
+        return False
+
+def exit_gracefully(signum, frame):
+    global run_app
+    run_app = False
 
 class Dump1090(object):
     def __init__(self, host, port):
@@ -171,17 +162,17 @@ class Dump1090(object):
         self.data = ''
 
     def connect(self):
-        log.info('Connecting to dump1090 TCP on {}:{}.'.format(self.host, self.port))
+        log.info('Connexion à dump1090 en TCP sur {}:{}.'.format(self.host, self.port))
         self.s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         connected = False
 
         while not connected:
             try:
                 self.s.connect((self.host, self.port))
-                log.info('Connected OK, receiving data')
+                log.info('Connexion OK, reception en cours')
             except:
                 connected = False
-                log.warning('Could not connect, retrying')
+                log.warning('Connexion impossible')
                 time.sleep(1)
             else:
                 connected = True
@@ -193,7 +184,6 @@ class Dump1090(object):
         self.s.close()
 
     def receive(self):
-        '''Returns one line in ADS-B MSG format.'''
 
         ret = None
 
@@ -213,93 +203,38 @@ class Dump1090(object):
         return ret
 
 
-class InfluxDB(object):
-    def __init__(self, url, database='dump1090', username="admin", password="influx"):
-        self.url = url
-        self.params = '/write?precision=s&db={}'.format(database)
 
-    def write(self, measurement, data, timestamp=None):
-        '''Write data with tags to measurement in InfluxDB. Use line protocol.'''
-
-        lines = []
-
-        for d in data:
-            fields = []
-            for k, v in d['fields'].items():
-                if v is None:
-                    # Skip all data with 'None' values.
-                    continue
-                elif type(v) is bool:
-                    # Boolean should be 't' or 'f'.
-                    fields.append('{}={}'.format(k, 't' if v else 'f'))
-                elif type(v) is int:
-                    fields.append('{}={}i'.format(k, v))
-                elif type(v) is float:
-                    fields.append('{}={}'.format(k, v))
-                elif type(v) is str:
-                    fields.append('{}="{}"'.format(k, v))
-                else:
-                    log.warning('Type {} not supported by InfluxDB. {}={}.'.format(
-                        type(v), k, v
-                    ))
-
-            lines.append('{measurement},{tags} {fields} {timestamp}'.format(
-                measurement = measurement,
-                tags = ','.join('{}={}'.format(k, v) for k, v in d['tags'].items()),
-                fields = ','.join(x for x in fields),
-                timestamp = d['timestamp'] if 'timestamp' in d else int(time.time()),
-            ))
-
-        resp = requests.post(self.url + self.params, data = '\n'.join(l for l in lines))
-        if resp.status_code == 204:
-            return True
-
-        log.error('Writing data to InfluxDB failed. Status code {}'.format(resp.status_code))
-        return False
-
-################################################################################
-# Functions
-################################################################################
-
-
-def exit_gracefully(signum, frame):
-    global run_app
-    run_app = False
-
-################################################################################
-# Main
-################################################################################
 
 
 def main():
     parser = argparse.ArgumentParser(
-        description = 'Read dump1090 TCP BaseStation data, '
-        'convert to InfluxDB line protocol, and send to InfluxDB'
+        description = 'Lis les données BaseStation de dump1090, '
+        'les convertis en "InfluxDB line protocol", et les envois vers InfluxDB'
     )
     parser.add_argument(
-        '-ds', '--dump1090-server',
+        '-s', '--dump1090-server',
         default = "127.0.0.1",
         help = "Host/IP for dump1090 [127.0.0.1]"
     )
     parser.add_argument(
-        '-dp', '--dump1090-port',
+        '-p', '--dump1090-port',
         default = "30003",
-        help = "Port for dump1090 TCP BaseStation data [30003]"
+        help = "Port pour la connexion TCP dump1090 pour les données BaseStation [30003]"
     )
     parser.add_argument(
-        '-iu', '--influx-url',
+        '-u', '--influx-url',
         default = "http://127.0.0.1:8186",
         help = "InfluxDB URL [http://127.0.0.1:8186]"
     )
     parser.add_argument(
         '-db', '--influx-database',
-        default = "adsb",
-        help = "InfluxDB datbase name [adsb]"
+        default = "dump1090",
+        help = "nom de la base de données InfluxDB"
     )
     parser.add_argument(
         '-si', '--send-interval',
         default = 60,
-        help = "Received data will be buffered and send to InfluxDB every X seconds."
+        help = "Reçoit les données, celles-ci seront stockées et envoyées vers InfluxDB toute les X secondes."
     )
 
     args = parser.parse_args()
@@ -307,7 +242,7 @@ def main():
 
     INTERVAL = int(args.send_interval)
 
-    ap = AdsbProcessor()
+    ap = Adsbmeg()
 
     dump1090 = Dump1090(args.dump1090_server, int(args.dump1090_port))
     dump1090.connect()
@@ -328,20 +263,18 @@ def main():
 
             for hexident, msg in ap.items():
                 if not all(k in msg for k in ['callsign', 'squawk']):
-                    log.info('Missing callsign or squawk for {}'.format(hexident))
+                    log.info('callsign ou squawk manquant pour {}'.format(hexident))
                     continue
 
                 if ap.age(hexident) > INTERVAL:
-                    log.info('Aircraft {} was not seen too long. Not sending.'.format(hexident))
+                    log.info('l Avion {} n as pas été vu depuis longtemps.'.format(hexident))
                     continue
 
-                # Create Unix timestamp from "generated date and time". The message's
-                # date and time is in UTC, thus we have to use calendar.
                 timestamp = int(calendar.timegm(time.strptime('{} {}'.format(
                     msg['gen_date'], msg['gen_time']
                 ), '%Y/%m/%d %H:%M:%S.%f')))
 
-                # Prepare data and tags so it can be sent to InfluxDB.
+                # Prepare les données et les tags à envoyer.
                 to_send.append({
                     'tags': {
                         'hexident': hexident,
@@ -369,9 +302,9 @@ def main():
             ap.clear(INTERVAL * 3)
             if len(to_send) > 0:
                 if influx.write('avions', to_send):
-                    log.info('Saved {} aircrafts to InfluxDB.'.format(len(to_send)))
+                    log.info('Sauvegarde de {} avions vers InfluxDB.'.format(len(to_send)))
             else:
-                log.info('No aircrafts to be saved in DB.')
+                log.info('Aucun avions sauvegardés.')
 
         try:
             msg = dump1090.receive()
@@ -382,7 +315,7 @@ def main():
             if msg is not None:
                 ap.msg(msg)
 
-    log.info("Disconnected from dump1090")
+    log.info("Déconnecté de dump1090")
     dump1090.disconnect()
 
 if __name__ == "__main__":
